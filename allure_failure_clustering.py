@@ -19,6 +19,7 @@ import json
 import re
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -54,10 +55,10 @@ def find_failed_step(steps: list) -> Optional[str]:
     return None
 
 
-def load_failures(results_dir: Path) -> list[TestFailure]:
-    """Читает все *-result.json из папки allure-results и оставляет
-    только failed/broken тесты."""
-    failures = []
+def load_all_attempts(results_dir: Path) -> list[dict]:
+    """Читает ВСЕ *-result.json (независимо от статуса) — нужно, чтобы
+    видеть все попытки теста при ретраях, а не только упавшие."""
+    records = []
 
     for path in results_dir.glob("*-result.json"):
         try:
@@ -65,25 +66,78 @@ def load_failures(results_dir: Path) -> list[TestFailure]:
         except (json.JSONDecodeError, OSError):
             continue
 
-        status = data.get("status")
-        if status not in ("failed", "broken"):
+        # historyId — стабильный идентификатор теста у Allure, одинаковый
+        # у всех попыток одного и того же теста (в т.ч. при ретраях).
+        # Если его почему-то нет (старый адаптер/кастомный раннер) —
+        # откатываемся на имя теста, это хуже, но не ломает пайплайн.
+        history_id = data.get("historyId") or data.get("name")
+
+        records.append({
+            "history_id": history_id,
+            "name": data.get("name", path.stem),
+            "status": data.get("status"),
+            "message": (data.get("statusDetails", {}) or {}).get("message", "") or "",
+            "trace": (data.get("statusDetails", {}) or {}).get("trace", "") or "",
+            "steps": data.get("steps", []) or [],
+            "start": data.get("start", 0),
+        })
+
+    return records
+
+
+def partition_flaky(records: list[dict]) -> tuple[list[TestFailure], list[str]]:
+    """Группирует попытки по historyId и разделяет на:
+      - genuine_failures — тесты, у которых ВСЕ попытки упали (реальная
+        проблема, не флейки). Берём последнюю по времени попытку —
+        это финальное состояние теста.
+      - flaky_names — тесты, у которых есть и failed/broken, и passed
+        попытки. Они успешно прошли после ретрая — не считаем это
+        ошибкой и не пускаем в кластеризацию причин падений.
+    """
+    by_history: dict[str, list[dict]] = defaultdict(list)
+    for r in records:
+        by_history[r["history_id"]].append(r)
+
+    genuine_failures = []
+    flaky_names = []
+
+    for history_id, attempts in by_history.items():
+        statuses = {a["status"] for a in attempts}
+
+        has_passed = "passed" in statuses
+        has_failed = bool(statuses & {"failed", "broken"})
+
+        if has_passed and has_failed:
+            # тест шатался: упал, потом прошёл (или наоборот) — флейки,
+            # не ошибка в смысле кластеризации причин падений
+            flaky_names.append(attempts[0]["name"])
             continue
 
-        details = data.get("statusDetails", {}) or {}
-        message = details.get("message", "") or ""
-        trace = details.get("trace", "") or ""
-        steps = data.get("steps", []) or []
+        if not has_failed:
+            # все попытки passed (или другой нейтральный статус) —
+            # тест просто прошёл, не нужен ни в failures, ни в flaky
+            continue
 
-        failures.append(TestFailure(
-            test_name=data.get("name", path.stem),
-            status=status,
-            message=message,
-            trace=trace,
-            failed_step=find_failed_step(steps),
-            start=data.get("start", 0),
+        # все попытки упали — берём последнюю по времени как финальную
+        last = max(attempts, key=lambda a: a.get("start", 0))
+        genuine_failures.append(TestFailure(
+            test_name=last["name"],
+            status=last["status"],
+            message=last["message"],
+            trace=last["trace"],
+            failed_step=find_failed_step(last["steps"]),
+            start=last["start"],
         ))
 
-    return failures
+    return genuine_failures, flaky_names
+
+
+def load_failures(results_dir: Path) -> list[TestFailure]:
+    """Обратная совместимость: как раньше, но теперь под капотом
+    исключает флейки-тесты (упал → потом прошёл на ретрае)."""
+    records = load_all_attempts(results_dir)
+    genuine_failures, _ = partition_flaky(records)
+    return genuine_failures
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +354,40 @@ def build_dashboard_html(groups: dict, mode: str, results_dir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 6. Отчёт (консоль)
+# 6. JSON-экспорт (вход для run_summary.py)
+# ---------------------------------------------------------------------------
+
+def build_summary_json(groups: dict, mode: str, results_dir: str) -> dict:
+    """Компактное представление результата кластеризации — без полных
+    трейсов и лишних деталей, чтобы легко передавать дальше (в скрипт
+    сводки, в историю прогонов и т.д.)."""
+    sorted_groups = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
+    total = sum(len(v) for v in groups.values())
+
+    clusters = []
+    for pattern, items in sorted_groups:
+        steps = [f.failed_step for f in items if f.failed_step]
+        top_step = max(set(steps), key=steps.count) if steps else None
+        clusters.append({
+            "pattern": pattern[:300],
+            "count": len(items),
+            "share": round(len(items) / total, 4) if total else 0,
+            "most_common_failed_step": top_step,
+            "example_tests": [f.test_name for f in items[:5]],
+        })
+
+    return {
+        "generated_at": None,  # заполняется в main() реальным временем
+        "results_dir": str(results_dir),
+        "mode": mode,
+        "total_failed": total,
+        "cluster_count": len(groups),
+        "clusters": clusters,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. Отчёт (консоль)
 # ---------------------------------------------------------------------------
 
 def print_report(groups: dict[str, list[TestFailure]]) -> None:
@@ -349,15 +436,59 @@ def main():
         help="Путь для сохранения HTML-дашборда (например, report.html). "
              "Если не указан, дашборд не создаётся — только консольный вывод.",
     )
+    parser.add_argument(
+        "--json",
+        type=Path,
+        default=None,
+        help="Путь для сохранения результата кластеризации в JSON "
+             "(вход для run_summary.py и для сравнения прогонов между собой).",
+    )
+    parser.add_argument(
+        "--include-flaky",
+        action="store_true",
+        help="Не исключать флейки-тесты (упал → потом прошёл на ретрае) "
+             "из кластеризации. По умолчанию они исключаются.",
+    )
     args = parser.parse_args()
 
     if not args.results_dir.is_dir():
         print(f"Папка не найдена: {args.results_dir}")
         sys.exit(1)
 
-    failures = load_failures(args.results_dir)
+    records = load_all_attempts(args.results_dir)
+    if not records:
+        print("Результаты не найдены (папка не содержит allure-results).")
+        return
+
+    genuine_failures, flaky_names = partition_flaky(records)
+
+    if flaky_names:
+        print(f"Обнаружено флейки-тестов (упал → прошёл на ретрае): {len(flaky_names)}")
+        for name in flaky_names[:10]:
+            print(f"  - {name}")
+        if len(flaky_names) > 10:
+            print(f"  ... и ещё {len(flaky_names) - 10}")
+        print()
+
+    if args.include_flaky:
+        # если явно попросили не исключать — считаем флейки обычным failed
+        # на основе их последней упавшей попытки
+        by_history: dict = defaultdict(list)
+        for r in records:
+            by_history[r["history_id"]].append(r)
+        for name in flaky_names:
+            attempts = [a for a in records if a["name"] == name and a["status"] in ("failed", "broken")]
+            if attempts:
+                last = max(attempts, key=lambda a: a.get("start", 0))
+                genuine_failures.append(TestFailure(
+                    test_name=last["name"], status=last["status"],
+                    message=last["message"], trace=last["trace"],
+                    failed_step=find_failed_step(last["steps"]), start=last["start"],
+                ))
+
+    failures = genuine_failures
     if not failures:
-        print("Упавших тестов не найдено (или папка не содержит allure-results).")
+        print("Тестов с окончательным падением не найдено (все либо прошли, либо флейки).")
         return
 
     if args.mode == "ml":
@@ -371,6 +502,12 @@ def main():
         html = build_dashboard_html(groups, mode=args.mode, results_dir=str(args.results_dir))
         args.html.write_text(html, encoding="utf-8")
         print(f"HTML-дашборд сохранён: {args.html.resolve()}")
+
+    if args.json:
+        summary = build_summary_json(groups, mode=args.mode, results_dir=str(args.results_dir))
+        summary["generated_at"] = datetime.now(timezone.utc).isoformat()
+        args.json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"JSON сохранён: {args.json.resolve()}")
 
 
 if __name__ == "__main__":
