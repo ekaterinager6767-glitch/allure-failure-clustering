@@ -1,0 +1,19 @@
+# HTML-дашборды и прочие сгенерированные отчёты
+report.html
+*-report.html
+report*.html
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Локальные результаты Allure (раскомментируй, если не хочешь хранить их в git)
+# allure-results/
+
+# macOS
+.DS_Store
