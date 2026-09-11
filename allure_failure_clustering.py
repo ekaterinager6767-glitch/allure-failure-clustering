@@ -321,8 +321,11 @@ def _build_bar_chart_svg(sorted_groups: list, max_bars: int = 15) -> str:
     '''
 
 
-def build_dashboard_html(groups: dict, mode: str, results_dir: str,
-                          total_label: str = "всего упавших тестов") -> str:
+def _render_section(groups: dict, title: str, total_label: str, bar_color: str) -> str:
+    """Рендерит один раздел дашборда (заголовок + график + список
+    кластеров) — под конкретный набор групп (падения ИЛИ флейки).
+    Несколько таких разделов можно поставить на одну страницу подряд —
+    так на одном дашборде оказываются сразу два графика."""
     sorted_groups = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
     total = sum(len(v) for v in groups.values())
     chart_svg = _build_bar_chart_svg(sorted_groups)
@@ -343,6 +346,40 @@ def build_dashboard_html(groups: dict, mode: str, results_dir: str,
         </details>
         ''')
 
+    return f'''
+    <section class="section" style="--bar:{bar_color}">
+        <h2>{_esc(title)}</h2>
+        <div class="meta">
+            {_esc(total_label)}: {total} &middot; кластеров: {len(groups)}
+        </div>
+
+        <div class="card">
+            {chart_svg}
+        </div>
+
+        <div class="card">
+            {''.join(rows) if rows else '<p>Нет данных.</p>'}
+        </div>
+    </section>
+    '''
+
+
+def build_dashboard_html(sections: list[dict], mode: str, results_dir: str) -> str:
+    """Собирает страницу дашборда из одного или нескольких разделов.
+
+    Каждый элемент sections — {"groups", "title", "total_label",
+    "bar_color"}. Один раздел — как раньше, один график; два раздела
+    (падения + флейки) — два графика на одной странице друг под другом,
+    каждый со своим цветом.
+    """
+    rendered = "".join(
+        _render_section(
+            s["groups"], s["title"], s["total_label"],
+            s.get("bar_color", "#4f7cff"),
+        )
+        for s in sections
+    )
+
     return f'''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -352,7 +389,11 @@ def build_dashboard_html(groups: dict, mode: str, results_dir: str,
     :root {{ --fg:#222; --bar:#4f7cff; --bg:#fafafa; --card:#fff; --border:#e3e3e8; }}
     body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--fg); margin:0; padding:32px; }}
     h1 {{ font-size:20px; margin-bottom:4px; }}
-    .meta {{ color:#777; font-size:13px; margin-bottom:24px; }}
+    h2 {{ font-size:16px; margin:0 0 4px; }}
+    .top-meta {{ color:#777; font-size:13px; margin-bottom:24px; }}
+    .section {{ margin-bottom:36px; }}
+    .section:last-child {{ margin-bottom:0; }}
+    .meta {{ color:#777; font-size:13px; margin-bottom:16px; }}
     .card {{ background:var(--card); border:1px solid var(--border); border-radius:10px; padding:20px; margin-bottom:20px; }}
     .cluster {{ border-bottom:1px solid var(--border); padding:10px 0; }}
     .cluster:last-child {{ border-bottom:none; }}
@@ -366,18 +407,11 @@ def build_dashboard_html(groups: dict, mode: str, results_dir: str,
 </head>
 <body>
     <h1>Allure Failure Clustering</h1>
-    <div class="meta">
-        Источник: {_esc(results_dir)} &middot; режим: {_esc(mode)} &middot;
-        {_esc(total_label)}: {total} &middot; кластеров: {len(groups)}
+    <div class="top-meta">
+        Источник: {_esc(results_dir)} &middot; режим: {_esc(mode)}
     </div>
 
-    <div class="card">
-        {chart_svg}
-    </div>
-
-    <div class="card">
-        {''.join(rows)}
-    </div>
+    {rendered}
 </body>
 </html>
 '''
@@ -545,6 +579,7 @@ def main():
         print("Тестов с окончательным падением не найдено (все либо прошли, либо флейки).")
         return
 
+    groups = None
     if failures:
         if args.mode == "ml":
             groups = group_failures_ml(failures, min_cluster_size=args.min_cluster_size)
@@ -552,11 +587,6 @@ def main():
             groups = group_failures_exact(failures)
 
         print_report(groups)
-
-        if args.html:
-            html = build_dashboard_html(groups, mode=args.mode, results_dir=str(args.results_dir))
-            args.html.write_text(html, encoding="utf-8")
-            print(f"HTML-дашборд сохранён: {args.html.resolve()}")
 
         if args.json:
             summary = build_summary_json(groups, mode=args.mode, results_dir=str(args.results_dir))
@@ -569,6 +599,7 @@ def main():
     # падения (до того, как они прошли на ретрае). Помогает увидеть,
     # что чаще всего "шатает" тесты, даже если итоговый прогон зелёный.
     # -----------------------------------------------------------------
+    flaky_groups = None
     if flaky_failures:
         if args.mode == "ml":
             flaky_groups = group_failures_ml(flaky_failures, min_cluster_size=args.min_cluster_size)
@@ -580,14 +611,6 @@ def main():
         print("=" * 60)
         print_report(flaky_groups, total_label="Всего flaky-тестов")
 
-        if args.flaky_html:
-            flaky_html = build_dashboard_html(
-                flaky_groups, mode=args.mode, results_dir=str(args.results_dir),
-                total_label="всего flaky-тестов",
-            )
-            args.flaky_html.write_text(flaky_html, encoding="utf-8")
-            print(f"HTML-дашборд по flaky сохранён: {args.flaky_html.resolve()}")
-
         if args.flaky_json:
             flaky_summary = build_summary_json(
                 flaky_groups, mode=args.mode, results_dir=str(args.results_dir), kind="flaky",
@@ -595,6 +618,39 @@ def main():
             flaky_summary["generated_at"] = datetime.now(timezone.utc).isoformat()
             args.flaky_json.write_text(json.dumps(flaky_summary, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"JSON по flaky сохранён: {args.flaky_json.resolve()}")
+
+    # -----------------------------------------------------------------
+    # HTML: --html рисует оба графика (падения + флейки) на одной
+    # странице, если есть и то, и другое — --flaky-html дополнительно
+    # сохраняет отдельный файл только с графиком флейки.
+    # -----------------------------------------------------------------
+    if args.html:
+        sections = []
+        if groups:
+            sections.append({
+                "groups": groups, "title": "Причины падений",
+                "total_label": "всего упавших тестов", "bar_color": "#4f7cff",
+            })
+        if flaky_groups:
+            sections.append({
+                "groups": flaky_groups, "title": "Flaky-тесты (упал → прошёл на ретрае)",
+                "total_label": "всего flaky-тестов", "bar_color": "#f59f00",
+            })
+        html = build_dashboard_html(sections, mode=args.mode, results_dir=str(args.results_dir))
+        args.html.write_text(html, encoding="utf-8")
+        chart_note = " (2 графика: падения + флейки)" if len(sections) > 1 else ""
+        print(f"HTML-дашборд сохранён: {args.html.resolve()}{chart_note}")
+
+    if args.flaky_html and flaky_groups:
+        flaky_html = build_dashboard_html(
+            [{
+                "groups": flaky_groups, "title": "Flaky-тесты (упал → прошёл на ретрае)",
+                "total_label": "всего flaky-тестов", "bar_color": "#f59f00",
+            }],
+            mode=args.mode, results_dir=str(args.results_dir),
+        )
+        args.flaky_html.write_text(flaky_html, encoding="utf-8")
+        print(f"HTML-дашборд по flaky сохранён: {args.flaky_html.resolve()}")
 
 
 if __name__ == "__main__":

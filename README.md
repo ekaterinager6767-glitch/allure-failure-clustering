@@ -63,6 +63,10 @@ python allure_failure_clustering.py allure-results --mode ml
 python allure_failure_clustering.py allure-results --mode ml --html report.html
 ```
 
+Если в папке есть и обычные падения, и flaky-тесты (см. ниже), в `report.html`
+будет **два графика на одной странице** — один для окончательных падений
+(синий), второй для flaky (оранжевый), каждый со своим списком кластеров.
+
 ### Flaky-тесты (упал → потом прошёл на ретрае)
 
 Скрипт сам находит тесты, у которых была хотя бы одна упавшая попытка, но
@@ -72,8 +76,16 @@ python allure_failure_clustering.py allure-results --mode ml --html report.html
 первого падения, чтобы было видно, что чаще всего вызывает нестабильность:
 
 ```bash
+python allure_failure_clustering.py allure-results --mode ml --html report.html
+```
+
+По умолчанию флейки-график просто окажется вторым разделом в том же
+`report.html` (см. выше). Если нужен ещё и отдельный файл только с
+flaky-графиком — добавь `--flaky-html`:
+
+```bash
 python allure_failure_clustering.py allure-results --mode ml \
-  --flaky-html flaky-report.html --flaky-json flaky-report.json
+  --html report.html --flaky-html flaky-report.html --flaky-json flaky-report.json
 ```
 
 В консоли это отдельный блок «Кластеризация flaky-тестов», у каждого теста
