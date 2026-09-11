@@ -34,13 +34,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 class TestFailure:
     def __init__(self, test_name: str, status: str, message: str,
-                 trace: str, failed_step: Optional[str], start: int):
+                 trace: str, failed_step: Optional[str], start: int,
+                 retries: int = 0):
         self.test_name = test_name
         self.status = status          # failed / broken
         self.message = message
         self.trace = trace
         self.failed_step = failed_step
         self.start = start
+        # для flaky-тестов — сколько раз тест упал, прежде чем пройти
+        # (0 для обычных, "окончательно упавших" тестов)
+        self.retries = retries
 
 
 def find_failed_step(steps: list) -> Optional[str]:
@@ -85,21 +89,24 @@ def load_all_attempts(results_dir: Path) -> list[dict]:
     return records
 
 
-def partition_flaky(records: list[dict]) -> tuple[list[TestFailure], list[str]]:
+def partition_flaky(records: list[dict]) -> tuple[list[TestFailure], list[TestFailure]]:
     """Группирует попытки по historyId и разделяет на:
       - genuine_failures — тесты, у которых ВСЕ попытки упали (реальная
         проблема, не флейки). Берём последнюю по времени попытку —
         это финальное состояние теста.
-      - flaky_names — тесты, у которых есть и failed/broken, и passed
-        попытки. Они успешно прошли после ретрая — не считаем это
-        ошибкой и не пускаем в кластеризацию причин падений.
+      - flaky_failures — тесты, у которых есть и failed/broken, и passed
+        попытки: упали, но в итоге прошли на ретрае. Для кластеризации
+        причины берём их ПЕРВУЮ по времени упавшую попытку — именно она
+        объясняет, из-за чего тест изначально зашатался; каждой такой
+        записи проставляем retries — сколько раз тест падал перед тем,
+        как пройти.
     """
     by_history: dict[str, list[dict]] = defaultdict(list)
     for r in records:
         by_history[r["history_id"]].append(r)
 
     genuine_failures = []
-    flaky_names = []
+    flaky_failures = []
 
     for history_id, attempts in by_history.items():
         statuses = {a["status"] for a in attempts}
@@ -109,8 +116,22 @@ def partition_flaky(records: list[dict]) -> tuple[list[TestFailure], list[str]]:
 
         if has_passed and has_failed:
             # тест шатался: упал, потом прошёл (или наоборот) — флейки,
-            # не ошибка в смысле кластеризации причин падений
-            flaky_names.append(attempts[0]["name"])
+            # не ошибка в смысле кластеризации причин падений, но у него
+            # есть своя причина первого падения — кластеризуем отдельно
+            sorted_attempts = sorted(attempts, key=lambda a: a.get("start", 0))
+            first_failure = next(
+                a for a in sorted_attempts if a["status"] in ("failed", "broken")
+            )
+            fail_count = sum(1 for a in attempts if a["status"] in ("failed", "broken"))
+            flaky_failures.append(TestFailure(
+                test_name=first_failure["name"],
+                status=first_failure["status"],
+                message=first_failure["message"],
+                trace=first_failure["trace"],
+                failed_step=find_failed_step(first_failure["steps"]),
+                start=first_failure["start"],
+                retries=fail_count,
+            ))
             continue
 
         if not has_failed:
@@ -129,7 +150,7 @@ def partition_flaky(records: list[dict]) -> tuple[list[TestFailure], list[str]]:
             start=last["start"],
         ))
 
-    return genuine_failures, flaky_names
+    return genuine_failures, flaky_failures
 
 
 def load_failures(results_dir: Path) -> list[TestFailure]:
@@ -202,11 +223,19 @@ def group_failures_ml(
         # тестов слишком мало для осмысленной кластеризации
         return {"Кластер 1 (мало данных для ML)": failures}
 
+    # max_df=0.95 при малом числе сообщений (частый случай для flaky —
+    # их обычно меньше, чем "настоящих" падений) может вырезать ВСЕ
+    # термы разом, если сообщения текстуально совпадают (каждый терм
+    # встречается в 100% документов) — тогда TfidfVectorizer падает с
+    # "no terms remain". Отключаем отсечение по частоте при малой
+    # выборке, где оно бесполезно и опасно.
+    max_df = 0.95 if len(normalized) >= 10 else 1.0
+
     vectorizer = TfidfVectorizer(
         analyzer="word",
         ngram_range=(1, 2),
         min_df=1,
-        max_df=0.95,
+        max_df=max_df,
         sublinear_tf=True,
     )
     matrix = vectorizer.fit_transform(normalized)
@@ -292,7 +321,8 @@ def _build_bar_chart_svg(sorted_groups: list, max_bars: int = 15) -> str:
     '''
 
 
-def build_dashboard_html(groups: dict, mode: str, results_dir: str) -> str:
+def build_dashboard_html(groups: dict, mode: str, results_dir: str,
+                          total_label: str = "всего упавших тестов") -> str:
     sorted_groups = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
     total = sum(len(v) for v in groups.values())
     chart_svg = _build_bar_chart_svg(sorted_groups)
@@ -301,7 +331,7 @@ def build_dashboard_html(groups: dict, mode: str, results_dir: str) -> str:
     for i, (pattern, items) in enumerate(sorted_groups, start=1):
         steps = [f.failed_step for f in items if f.failed_step]
         top_step = max(set(steps), key=steps.count) if steps else "—"
-        test_list = "".join(f"<li>{_esc(f.test_name)}</li>" for f in items)
+        test_list = "".join(f"<li>{_esc(_fmt_test_name(f))}</li>" for f in items)
         rows.append(f'''
         <details class="cluster">
             <summary>
@@ -338,7 +368,7 @@ def build_dashboard_html(groups: dict, mode: str, results_dir: str) -> str:
     <h1>Allure Failure Clustering</h1>
     <div class="meta">
         Источник: {_esc(results_dir)} &middot; режим: {_esc(mode)} &middot;
-        всего упавших тестов: {total} &middot; кластеров: {len(groups)}
+        {_esc(total_label)}: {total} &middot; кластеров: {len(groups)}
     </div>
 
     <div class="card">
@@ -357,7 +387,7 @@ def build_dashboard_html(groups: dict, mode: str, results_dir: str) -> str:
 # 6. JSON-экспорт (вход для run_summary.py)
 # ---------------------------------------------------------------------------
 
-def build_summary_json(groups: dict, mode: str, results_dir: str) -> dict:
+def build_summary_json(groups: dict, mode: str, results_dir: str, kind: str = "failures") -> dict:
     """Компактное представление результата кластеризации — без полных
     трейсов и лишних деталей, чтобы легко передавать дальше (в скрипт
     сводки, в историю прогонов и т.д.)."""
@@ -380,6 +410,7 @@ def build_summary_json(groups: dict, mode: str, results_dir: str) -> dict:
         "generated_at": None,  # заполняется в main() реальным временем
         "results_dir": str(results_dir),
         "mode": mode,
+        "kind": kind,          # "failures" — окончательные падения, "flaky" — упал → прошёл
         "total_failed": total,
         "cluster_count": len(groups),
         "clusters": clusters,
@@ -390,12 +421,19 @@ def build_summary_json(groups: dict, mode: str, results_dir: str) -> dict:
 # 7. Отчёт (консоль)
 # ---------------------------------------------------------------------------
 
-def print_report(groups: dict[str, list[TestFailure]]) -> None:
+def _fmt_test_name(f: TestFailure) -> str:
+    """Имя теста + пометка о ретраях для flaky-тестов."""
+    if f.retries:
+        return f"{f.test_name} (упал {f.retries} раз(а), затем прошёл)"
+    return f.test_name
+
+
+def print_report(groups: dict[str, list[TestFailure]], total_label: str = "Всего упавших тестов") -> None:
     # сортируем кластеры по размеру, самые массовые — первыми
     sorted_groups = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
 
     total = sum(len(v) for v in groups.values())
-    print(f"Всего упавших тестов: {total}")
+    print(f"{total_label}: {total}")
     print(f"Уникальных кластеров причин: {len(groups)}\n")
 
     for i, (pattern, items) in enumerate(sorted_groups, start=1):
@@ -408,7 +446,7 @@ def print_report(groups: dict[str, list[TestFailure]]) -> None:
             most_common_step = max(set(steps), key=steps.count)
             print(f"  Чаще всего падает на шаге: {most_common_step}")
 
-        example_names = [f.test_name for f in items[:3]]
+        example_names = [_fmt_test_name(f) for f in items[:3]]
         print(f"  Примеры тестов: {', '.join(example_names)}")
         print()
 
@@ -447,7 +485,22 @@ def main():
         "--include-flaky",
         action="store_true",
         help="Не исключать флейки-тесты (упал → потом прошёл на ретрае) "
-             "из кластеризации. По умолчанию они исключаются.",
+             "из основной кластеризации причин падений. По умолчанию они "
+             "исключаются оттуда (но всё равно кластеризуются отдельно, "
+             "см. --flaky-html/--flaky-json).",
+    )
+    parser.add_argument(
+        "--flaky-html",
+        type=Path,
+        default=None,
+        help="Путь для сохранения отдельного HTML-дашборда по flaky-тестам "
+             "(упал → прошёл на ретрае), например flaky-report.html.",
+    )
+    parser.add_argument(
+        "--flaky-json",
+        type=Path,
+        default=None,
+        help="Путь для сохранения кластеризации flaky-тестов в JSON.",
     )
     args = parser.parse_args()
 
@@ -460,24 +513,25 @@ def main():
         print("Результаты не найдены (папка не содержит allure-results).")
         return
 
-    genuine_failures, flaky_names = partition_flaky(records)
+    genuine_failures, flaky_failures = partition_flaky(records)
 
-    if flaky_names:
-        print(f"Обнаружено флейки-тестов (упал → прошёл на ретрае): {len(flaky_names)}")
-        for name in flaky_names[:10]:
-            print(f"  - {name}")
-        if len(flaky_names) > 10:
-            print(f"  ... и ещё {len(flaky_names) - 10}")
+    if flaky_failures:
+        print(f"Обнаружено флейки-тестов (упал → прошёл на ретрае): {len(flaky_failures)}")
+        for f in flaky_failures[:10]:
+            print(f"  - {_fmt_test_name(f)}")
+        if len(flaky_failures) > 10:
+            print(f"  ... и ещё {len(flaky_failures) - 10}")
         print()
 
     if args.include_flaky:
         # если явно попросили не исключать — считаем флейки обычным failed
-        # на основе их последней упавшей попытки
-        by_history: dict = defaultdict(list)
-        for r in records:
-            by_history[r["history_id"]].append(r)
-        for name in flaky_names:
-            attempts = [a for a in records if a["name"] == name and a["status"] in ("failed", "broken")]
+        # на основе их последней упавшей попытки (а не первой, которую
+        # используем для отдельной flaky-кластеризации ниже)
+        for f in flaky_failures:
+            attempts = [
+                a for a in records
+                if a["name"] == f.test_name and a["status"] in ("failed", "broken")
+            ]
             if attempts:
                 last = max(attempts, key=lambda a: a.get("start", 0))
                 genuine_failures.append(TestFailure(
@@ -487,27 +541,60 @@ def main():
                 ))
 
     failures = genuine_failures
-    if not failures:
+    if not failures and not flaky_failures:
         print("Тестов с окончательным падением не найдено (все либо прошли, либо флейки).")
         return
 
-    if args.mode == "ml":
-        groups = group_failures_ml(failures, min_cluster_size=args.min_cluster_size)
-    else:
-        groups = group_failures_exact(failures)
+    if failures:
+        if args.mode == "ml":
+            groups = group_failures_ml(failures, min_cluster_size=args.min_cluster_size)
+        else:
+            groups = group_failures_exact(failures)
 
-    print_report(groups)
+        print_report(groups)
 
-    if args.html:
-        html = build_dashboard_html(groups, mode=args.mode, results_dir=str(args.results_dir))
-        args.html.write_text(html, encoding="utf-8")
-        print(f"HTML-дашборд сохранён: {args.html.resolve()}")
+        if args.html:
+            html = build_dashboard_html(groups, mode=args.mode, results_dir=str(args.results_dir))
+            args.html.write_text(html, encoding="utf-8")
+            print(f"HTML-дашборд сохранён: {args.html.resolve()}")
 
-    if args.json:
-        summary = build_summary_json(groups, mode=args.mode, results_dir=str(args.results_dir))
-        summary["generated_at"] = datetime.now(timezone.utc).isoformat()
-        args.json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"JSON сохранён: {args.json.resolve()}")
+        if args.json:
+            summary = build_summary_json(groups, mode=args.mode, results_dir=str(args.results_dir))
+            summary["generated_at"] = datetime.now(timezone.utc).isoformat()
+            args.json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"JSON сохранён: {args.json.resolve()}")
+
+    # -----------------------------------------------------------------
+    # Отдельная кластеризация flaky-тестов — по причине их ПЕРВОГО
+    # падения (до того, как они прошли на ретрае). Помогает увидеть,
+    # что чаще всего "шатает" тесты, даже если итоговый прогон зелёный.
+    # -----------------------------------------------------------------
+    if flaky_failures:
+        if args.mode == "ml":
+            flaky_groups = group_failures_ml(flaky_failures, min_cluster_size=args.min_cluster_size)
+        else:
+            flaky_groups = group_failures_exact(flaky_failures)
+
+        print("=" * 60)
+        print("Кластеризация flaky-тестов (упал → прошёл на ретрае)")
+        print("=" * 60)
+        print_report(flaky_groups, total_label="Всего flaky-тестов")
+
+        if args.flaky_html:
+            flaky_html = build_dashboard_html(
+                flaky_groups, mode=args.mode, results_dir=str(args.results_dir),
+                total_label="всего flaky-тестов",
+            )
+            args.flaky_html.write_text(flaky_html, encoding="utf-8")
+            print(f"HTML-дашборд по flaky сохранён: {args.flaky_html.resolve()}")
+
+        if args.flaky_json:
+            flaky_summary = build_summary_json(
+                flaky_groups, mode=args.mode, results_dir=str(args.results_dir), kind="flaky",
+            )
+            flaky_summary["generated_at"] = datetime.now(timezone.utc).isoformat()
+            args.flaky_json.write_text(json.dumps(flaky_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"JSON по flaky сохранён: {args.flaky_json.resolve()}")
 
 
 if __name__ == "__main__":
