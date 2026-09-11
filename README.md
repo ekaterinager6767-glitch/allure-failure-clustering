@@ -11,7 +11,7 @@
 ## Что нужно установить
 
 - **Python 3.9+** (проверить: `python3 --version`)
-- Python-пакеты из [requirements.txt](requirements.txt): `scikit-learn`, `numpy`
+- Python-пакеты из [requirements.txt](requirements.txt): `scikit-learn`, `numpy`, `matplotlib`
 
 ## Установка (один раз)
 

@@ -15,6 +15,8 @@
 """
 
 import argparse
+import base64
+import io
 import json
 import re
 import sys
@@ -23,6 +25,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import matplotlib
+matplotlib.use("Agg")  # без GUI-бэкенда — рендерим только в файл/буфер
+import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.cluster import HDBSCAN
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -283,42 +288,43 @@ def _esc(text: str) -> str:
     )
 
 
-def _build_bar_chart_svg(sorted_groups: list, max_bars: int = 15) -> str:
-    """Простой горизонтальный bar chart, целиком нарисованный в SVG.
-    Не тянет никаких JS-библиотек с CDN — важно для офлайн-агентов."""
+def _build_bar_chart_png(sorted_groups: list, bar_color: str = "#4f7cff", max_bars: int = 15) -> str:
+    """Горизонтальный bar chart через matplotlib, встроенный в HTML как
+    base64 PNG. Не тянет никаких JS-библиотек с CDN — важно для
+    офлайн-агентов, а сам график рисует matplotlib, а не рукописная
+    SVG-разметка."""
     top = sorted_groups[:max_bars]
     if not top:
         return "<p>Нет данных для графика.</p>"
 
-    max_count = max(len(items) for _, items in top)
-    bar_h = 28
-    gap = 10
-    label_w = 420
-    chart_w = 420
-    row_h = bar_h + gap
-    svg_h = row_h * len(top) + gap
-    svg_w = label_w + chart_w + 60
+    # снизу вверх для barh — переворачиваем, чтобы самый большой кластер
+    # оказался сверху, как в списке
+    labels = [(p if len(p) <= 55 else p[:52] + "...") for p, _ in top][::-1]
+    counts = [len(items) for _, items in top][::-1]
 
-    bars = []
-    for i, (pattern, items) in enumerate(top):
-        y = gap + i * row_h
-        count = len(items)
-        bar_len = int((count / max_count) * (chart_w - 10)) if max_count else 0
-        label = pattern if len(pattern) <= 60 else pattern[:57] + "..."
-        bars.append(f'''
-        <text x="{label_w - 10}" y="{y + bar_h / 2 + 5}" text-anchor="end"
-              font-size="12" fill="var(--fg,#333)">{_esc(label)}</text>
-        <rect x="{label_w}" y="{y}" width="{bar_len}" height="{bar_h}"
-              rx="4" fill="var(--bar,#4f7cff)" />
-        <text x="{label_w + bar_len + 8}" y="{y + bar_h / 2 + 5}"
-              font-size="12" fill="var(--fg,#333)">{count}</text>
-        ''')
+    fig_h = max(1.6, 0.5 * len(top) + 0.6)
+    fig, ax = plt.subplots(figsize=(8, fig_h), dpi=150)
+    bars = ax.barh(labels, counts, color=bar_color, height=0.6)
 
-    return f'''
-    <svg viewBox="0 0 {svg_w} {svg_h}" width="100%" style="max-width:900px">
-        {''.join(bars)}
-    </svg>
-    '''
+    max_count = max(counts)
+    for bar, count in zip(bars, counts):
+        ax.text(bar.get_width() + max_count * 0.015, bar.get_y() + bar.get_height() / 2,
+                str(count), va="center", fontsize=9, color="#333")
+
+    ax.set_xlim(0, max_count * 1.15)
+    ax.tick_params(axis="y", labelsize=9)
+    ax.tick_params(axis="x", labelsize=8)
+    for spine in ("top", "right", "bottom", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.set_xticks([])
+    ax.tick_params(axis="y", length=0)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", transparent=True)
+    plt.close(fig)
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f'<img src="data:image/png;base64,{encoded}" alt="Гистограмма кластеров" style="max-width:100%;height:auto">'
 
 
 def _render_section(groups: dict, title: str, total_label: str, bar_color: str) -> str:
@@ -328,7 +334,7 @@ def _render_section(groups: dict, title: str, total_label: str, bar_color: str) 
     так на одном дашборде оказываются сразу два графика."""
     sorted_groups = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
     total = sum(len(v) for v in groups.values())
-    chart_svg = _build_bar_chart_svg(sorted_groups)
+    chart_img = _build_bar_chart_png(sorted_groups, bar_color=bar_color)
 
     rows = []
     for i, (pattern, items) in enumerate(sorted_groups, start=1):
@@ -354,7 +360,7 @@ def _render_section(groups: dict, title: str, total_label: str, bar_color: str) 
         </div>
 
         <div class="card">
-            {chart_svg}
+            {chart_img}
         </div>
 
         <div class="card">
